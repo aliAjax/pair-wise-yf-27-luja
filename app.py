@@ -98,7 +98,15 @@ class ProvenanceStore:
                     claim_id INTEGER NOT NULL REFERENCES claims(id),
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
                     old_status TEXT NOT NULL, new_status TEXT NOT NULL,
-                    note TEXT NOT NULL, created_at TEXT NOT NULL
+                    note TEXT NOT NULL, exception_note TEXT, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS claim_conclusions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    object_id INTEGER NOT NULL REFERENCES objects(id),
+                    object_version INTEGER NOT NULL, payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded')),
+                    created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS object_versions(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +122,11 @@ class ProvenanceStore:
                 );
                 """
             )
+            # 升级迁移：旧版 claim_reviews 没有 exception_note 列。
+            review_cols = {r["name"] for r in conn.execute("PRAGMA table_info(claim_reviews)")}
+            if "exception_note" not in review_cols:
+                conn.execute("ALTER TABLE claim_reviews ADD COLUMN exception_note TEXT")
+            self._backfill_conclusions(conn)
 
     def seed(self):
         self.init_schema()
@@ -162,6 +175,67 @@ class ProvenanceStore:
             (object_id, row["version"], json.dumps(snapshot, ensure_ascii=False, sort_keys=True), actor, now()),
         )
 
+    def _supersede_object_conclusions(self, conn, object_id):
+        """藏品版本一变，该藏品上所有仍有效的结论即作废。"""
+        conn.execute("UPDATE claim_conclusions SET status='superseded' WHERE object_id=? AND status='active'", (object_id,))
+
+    def _conclusion_payload(self, conn, obj):
+        """按藏品当前状态生成结论内容：每段流转事件的来源与证据引用，以及还缺的环节。"""
+        events = conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (obj["id"],)).fetchall()
+        frozen_events, gaps = [], []
+        for event in events:
+            source = None
+            if event["source_id"]:
+                row = conn.execute("SELECT id,name,source_type,reference FROM sources WHERE id=?", (event["source_id"],)).fetchone()
+                source = dict(row) if row else None
+            evidence = [dict(x) for x in conn.execute(
+                "SELECT id,filename,sha256,size,visibility FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)).fetchall()]
+            event_gaps = []
+            if source is None:
+                event_gaps.append("missing_source")
+            if not evidence:
+                event_gaps.append("missing_evidence")
+            gaps += [{"event_id": event["id"], "type": g} for g in event_gaps]
+            frozen_events.append({
+                "event_id": event["id"], "event_type": event["event_type"],
+                "date_start": event["date_start"], "date_end": event["date_end"],
+                "place": event["place"], "visibility": event["visibility"],
+                "source": source, "evidence": evidence, "gaps": event_gaps,
+            })
+        if not events:
+            gaps.append({"event_id": None, "type": "no_events"})
+        return {
+            "object_id": obj["id"], "object_version": obj["version"], "frozen_at": now(),
+            "events": frozen_events, "gaps": gaps,
+        }
+
+    def _freeze_conclusion(self, conn, claim_id, object_id, actor):
+        """把藏品当前版本、事件来源与证据、缺口冻成结论；同一主张的旧结论随之作废。"""
+        conn.execute("UPDATE claim_conclusions SET status='superseded' WHERE claim_id=? AND status='active'", (claim_id,))
+        obj = self._object(conn, object_id)
+        payload = self._conclusion_payload(conn, obj)
+        cur = conn.execute(
+            """INSERT INTO claim_conclusions(claim_id,object_id,object_version,payload,status,created_by,created_at)
+               VALUES(?,?,?,?,'active',?,?)""",
+            (claim_id, object_id, obj["version"], json.dumps(payload, ensure_ascii=False, sort_keys=True), actor, now()),
+        )
+        return {"id": cur.lastrowid, "claim_id": claim_id, "object_id": object_id,
+                "object_version": obj["version"], "status": "active", "payload": payload}
+
+    def _backfill_conclusions(self, conn):
+        """升级迁移：为旧数据中已进入审查但还没有结论的主张，按当前藏品版本回填结论。"""
+        conn.execute("INSERT OR IGNORE INTO users(id,name,role) VALUES('system','系统迁移','staff')")
+        rows = conn.execute(
+            """SELECT c.id,c.object_id FROM claims c
+               WHERE c.status IN ('under_review','negotiating')
+                 AND NOT EXISTS(SELECT 1 FROM claim_conclusions cc WHERE cc.claim_id=c.id)
+               ORDER BY c.id"""
+        ).fetchall()
+        for row in rows:
+            conclusion = self._freeze_conclusion(conn, row["id"], row["object_id"], "system")
+            self._audit(conn, row["object_id"], "system", "claim.conclusion_backfill",
+                        {"claim_id": row["id"], "conclusion_id": conclusion["id"]})
+
     def create_object(self, user_id, inventory_no, title, object_type, holder, public_summary):
         inventory_no, title = inventory_no.strip(), title.strip()
         if not inventory_no or len(title) < 2:
@@ -195,6 +269,7 @@ class ProvenanceStore:
                 f"UPDATE objects SET {assignments},version=?,updated_at=? WHERE id=?",
                 (*clean.values(), new_version, now(), object_id),
             )
+            self._supersede_object_conclusions(conn, object_id)
             self._snapshot(conn, object_id, user_id)
             self._audit(conn, object_id, user_id, "object.update", {"version": new_version, "changes": clean})
             return {"id": object_id, "version": new_version, "changes": clean}
@@ -213,7 +288,7 @@ class ProvenanceStore:
                 raise BusinessError("来源记录已存在", 409, "source_exists")
             return {"id": cur.lastrowid, "name": name.strip(), "reference": reference.strip()}
 
-    def add_event(self, user_id, object_id, event_type, date_start, date_end, place, description, source_id=None, visibility="internal"):
+    def add_event(self, user_id, object_id, event_type, date_start, date_end, place, description, source_id=None, visibility="internal", base_version=None):
         if not event_type.strip() or not description.strip() or not place.strip():
             raise BusinessError("事件类型、地点和说明不能为空", 422, "invalid_event")
         try:
@@ -225,21 +300,38 @@ class ProvenanceStore:
             raise BusinessError("事件结束日期不能早于开始日期", 422, "invalid_date_range")
         if visibility not in {"public", "internal"}:
             raise BusinessError("visibility 必须是 public 或 internal", 422, "invalid_visibility")
+        if base_version is not None:
+            try:
+                base_version = int(base_version)
+            except (TypeError, ValueError):
+                raise BusinessError("base_version 必须是整数", 422, "invalid_base_version")
         with self.connect() as conn:
-            actor = self._user(conn, user_id, {"staff"})
-            row = self._object(conn, object_id)
-            if source_id and not conn.execute("SELECT 1 FROM sources WHERE id=?", (source_id,)).fetchone():
-                raise BusinessError("来源不存在", 404, "source_not_found")
-            cur = conn.execute(
-                """INSERT INTO events(object_id,event_type,date_start,date_end,place,description,source_id,visibility,created_by,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (object_id, event_type.strip(), date_start, date_end or None, place.strip(), description.strip(), source_id, visibility, user_id, now()),
-            )
-            new_version = row["version"] + 1
-            conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (new_version, now(), object_id))
-            self._snapshot(conn, object_id, user_id)
-            self._audit(conn, object_id, user_id, "event.add", {"event_id": cur.lastrowid, "version": new_version, "visibility": visibility})
-            return {"id": cur.lastrowid, "object_id": object_id, "object_version": new_version}
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"staff"})
+                row = self._object(conn, object_id)
+                has_conclusion = conn.execute(
+                    "SELECT 1 FROM claim_conclusions WHERE object_id=? LIMIT 1", (object_id,)).fetchone()
+                if has_conclusion and base_version is None:
+                    raise BusinessError("该藏品已存在受理结论，补充流转事件必须携带受理版本 base_version", 422, "base_version_required")
+                if base_version is not None and base_version != row["version"]:
+                    raise BusinessError("藏品版本已变化，旧结论已作废，请查看最新结论后重试", 409, "version_conflict")
+                if source_id and not conn.execute("SELECT 1 FROM sources WHERE id=?", (source_id,)).fetchone():
+                    raise BusinessError("来源不存在", 404, "source_not_found")
+                cur = conn.execute(
+                    """INSERT INTO events(object_id,event_type,date_start,date_end,place,description,source_id,visibility,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (object_id, event_type.strip(), date_start, date_end or None, place.strip(), description.strip(), source_id, visibility, user_id, now()),
+                )
+                new_version = row["version"] + 1
+                conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (new_version, now(), object_id))
+                self._supersede_object_conclusions(conn, object_id)
+                self._snapshot(conn, object_id, user_id)
+                self._audit(conn, object_id, user_id, "event.add", {"event_id": cur.lastrowid, "version": new_version, "visibility": visibility})
+                return {"id": cur.lastrowid, "object_id": object_id, "object_version": new_version}
+            except Exception:
+                conn.rollback()
+                raise
 
     def upload_evidence(self, user_id, object_id, filename, content_b64, visibility, event_id=None):
         if not filename.strip():
@@ -278,9 +370,10 @@ class ProvenanceStore:
             self._audit(conn, object_id, user_id, "claim.create", {"claim_id": cur.lastrowid})
             return {"id": cur.lastrowid, "object_id": object_id, "status": "submitted"}
 
-    def transition_claim(self, user_id, claim_id, new_status, note):
+    def transition_claim(self, user_id, claim_id, new_status, note, exception_note=""):
         if len(note.strip()) < 5:
             raise BusinessError("阶段审查说明至少 5 字", 422, "review_note_required")
+        exception_note = str(exception_note or "").strip()
         with self.connect() as conn:
             reviewer = self._user(conn, user_id, {"reviewer"})
             try:
@@ -291,18 +384,65 @@ class ProvenanceStore:
                 allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
                 if new_status not in allowed:
                     raise BusinessError(f"不能从 {claim['status']} 直接变更为 {new_status}", 409, "invalid_transition")
+                if claim["status"] == "under_review":
+                    # 离开受理阶段前，结论必须仍然有效；缺口未补齐时需要审查员例外说明。
+                    conclusion = conn.execute(
+                        "SELECT * FROM claim_conclusions WHERE claim_id=? ORDER BY id DESC LIMIT 1", (claim_id,)).fetchone()
+                    if not conclusion or conclusion["status"] != "active":
+                        raise BusinessError("受理结论已随藏品版本变化作废，请先重新冻结结论", 409, "stale_conclusion")
+                    if json.loads(conclusion["payload"])["gaps"] and len(exception_note) < 5:
+                        raise BusinessError("来源缺口未补齐，需审查员例外说明才能离开受理阶段", 409, "unresolved_gaps")
                 conn.execute("UPDATE claims SET status=?,updated_at=? WHERE id=?", (new_status, now(), claim_id))
                 conn.execute(
-                    "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
-                    (claim_id, user_id, claim["status"], new_status, note.strip(), now()),
+                    "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,exception_note,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (claim_id, user_id, claim["status"], new_status, note.strip(), exception_note or None, now()),
                 )
-                new_version = claim["object_id"]
                 obj = self._object(conn, claim["object_id"])
                 next_version = obj["version"] + 1
                 conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (next_version, now(), claim["object_id"]))
+                self._supersede_object_conclusions(conn, claim["object_id"])
+                conclusion = None
+                if new_status == "under_review":
+                    # 受理主张：把当前藏品版本、每段事件的来源与证据、还缺的环节冻成结论。
+                    conclusion = self._freeze_conclusion(conn, claim_id, claim["object_id"], user_id)
                 self._snapshot(conn, claim["object_id"], user_id)
                 self._audit(conn, claim["object_id"], user_id, "claim.transition", {"claim_id": claim_id, "from": claim["status"], "to": new_status})
-                return {"claim_id": claim_id, "old_status": claim["status"], "status": new_status, "object_version": next_version}
+                result = {"claim_id": claim_id, "old_status": claim["status"], "status": new_status, "object_version": next_version}
+                if conclusion:
+                    result["conclusion"] = conclusion
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+
+    def get_latest_conclusion(self, user_id, claim_id):
+        """查看最新受理结论（含冻结版本、事件来源与证据、内部缺口），仅审查员和工作人员。"""
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            claim = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+            if not claim:
+                raise BusinessError("权利主张不存在", 404, "not_found")
+            row = conn.execute(
+                "SELECT * FROM claim_conclusions WHERE claim_id=? ORDER BY id DESC LIMIT 1", (claim_id,)).fetchone()
+            if not row:
+                raise BusinessError("该主张尚无受理结论", 404, "conclusion_not_found")
+            return dict(row) | {"payload": json.loads(row["payload"])}
+
+    def refreeze_conclusion(self, user_id, claim_id):
+        """审查员按藏品当前版本重新冻结结论，作废旧结论。"""
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                claim = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+                if not claim:
+                    raise BusinessError("权利主张不存在", 404, "not_found")
+                if claim["status"] not in {"under_review", "negotiating"}:
+                    raise BusinessError("仅受理或协商阶段的主张可以重新冻结结论", 409, "not_reviewable")
+                conclusion = self._freeze_conclusion(conn, claim_id, claim["object_id"], user_id)
+                self._audit(conn, claim["object_id"], user_id, "claim.conclusion_refreeze",
+                            {"claim_id": claim_id, "conclusion_id": conclusion["id"], "object_version": conclusion["object_version"]})
+                return conclusion
             except Exception:
                 conn.rollback()
                 raise
@@ -417,7 +557,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 3 and method == "GET": return self._send(200, store.get_object(user, object_id))
             if len(parts) == 4 and parts[3] == "update" and method == "POST": return self._send(200, store.update_object(user, object_id, self._body().get("changes", {})))
             if len(parts) == 4 and parts[3] == "events" and method == "POST":
-                d = self._body(); return self._send(201, store.add_event(user, object_id, d.get("event_type", ""), d.get("date_start", ""), d.get("date_end", ""), d.get("place", ""), d.get("description", ""), d.get("source_id"), d.get("visibility", "internal")))
+                d = self._body(); return self._send(201, store.add_event(user, object_id, d.get("event_type", ""), d.get("date_start", ""), d.get("date_end", ""), d.get("place", ""), d.get("description", ""), d.get("source_id"), d.get("visibility", "internal"), d.get("base_version")))
             if len(parts) == 4 and parts[3] == "evidence" and method == "POST":
                 d = self._body(); return self._send(201, store.upload_evidence(user, object_id, d.get("filename", ""), d.get("content_b64", ""), d.get("visibility", "internal"), d.get("event_id")))
             if len(parts) == 4 and parts[3] == "claims" and method == "POST":
@@ -425,7 +565,10 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "history" and method == "GET": return self._send(200, {"items": store.object_history(user, object_id)})
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
-            d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", "")))
+            d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", ""), d.get("exception_note", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "conclusion":
+            if method == "GET": return self._send(200, store.get_latest_conclusion(user, int(parts[2])))
+            if method == "POST": return self._send(201, store.refreeze_conclusion(user, int(parts[2])))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method):
